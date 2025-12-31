@@ -1,0 +1,489 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+float3 cameraPosition;
+float4x4 localToWorldMatrix;
+int width;
+int height;
+float fov;
+float aspectRatio;
+int maxBounceCount;
+int numRaysPerPixel;
+int numRenderedFrames;
+int totalFrames;
+float divergeStrength;
+
+float4 SkyColorHorizon;
+float4 SkyColorZenith;
+float4 GroundColor;
+float3 SunPos;
+float SunFocus;
+float SunIntensity;
+
+struct Ray
+{
+    float3 dir;
+    float3 origin;
+    float3 transmittance;
+    int bounceCount;
+};
+
+struct RayTracingMaterial
+{
+    int flag;
+    float4 color;
+    float emissionStrength;
+    float4 emissionColor;
+    float smoothness;
+    float specularProbability;
+    float4 specularColor;
+    float ior;
+};
+
+struct HitInfo
+{
+    bool didHit;
+    float dst;
+    float3 hitPoint;
+    float3 normal;
+    int materialIndex;
+    bool isBackFace;
+};
+
+struct Triangle
+{
+    float3 posA;
+    float3 posB;
+    float3 posC;
+
+    float3 normalA;
+    float3 normalB;
+    float3 normalC;
+
+    int materialIndex;
+};
+
+struct Node
+{
+    float3 boundsMin;
+    float3 boundsMax;
+    int index;
+    int triangleCount;
+};
+
+struct MeshInfo
+{
+    int nodeOffset;
+    int triangleOffset;
+    int materialIndex;
+    float4x4 worldToLocalMatrix;
+    float4x4 localToWorldMatrix;
+};
+
+struct LightResponse
+{
+    float3 reflectDir;
+    float3 refractDir;
+    float reflectWeight;
+    float refractWeight;
+};
+
+StructuredBuffer<Triangle> triangles;
+StructuredBuffer<RayTracingMaterial> materials;
+StructuredBuffer<Node> nodes;
+StructuredBuffer<MeshInfo> meshes;
+
+int numTris;
+int numNodes;
+int numMeshes;
+
+Ray CreateNewRay(float3 dir, float3 origin, float3 transmittance, int bounceCount)
+{
+    Ray ray;
+    ray.dir = dir;
+    ray.origin = origin;
+    ray.transmittance = transmittance;
+    ray.bounceCount = bounceCount;
+    return ray;
+}
+
+float RandomValue(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result / 4294967295.0;
+}
+
+float RandomValueNormalDistribution(inout uint state)
+{
+    float theta = 2 * 3.1415926 * RandomValue(state);
+    float rho = sqrt(-2 * log(RandomValue(state)));
+    return rho * cos(theta);
+}
+
+float3 RandomDirection(inout uint state)
+{
+    float x = RandomValueNormalDistribution(state);
+    float y = RandomValueNormalDistribution(state);
+    float z = RandomValueNormalDistribution(state);
+    return normalize(float3(x,y,z));
+}
+
+float3 RandomHemisphereDirection(float3 normal, inout uint rngState)
+{
+    float3 dir = RandomDirection(rngState);
+    return dir * sign(dot(normal, dir));
+}
+
+float2 RandomPointInCircle(inout uint rngState)
+{
+    float angle = RandomValue(rngState) * 2 * 3.1415926;
+    float2 pointOnCircle = float2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(RandomValue(rngState));
+}
+
+float3 GetTransformedRay(uint3 id : SV_DispatchThreadID, inout uint rngState)
+{
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height) * 2.0 - 1.0;
+    uv.x *= aspectRatio;
+
+    float scale = tan(radians(fov * 0.5));
+    float3 localRayDir = normalize(float3(uv.x * scale, uv.y * scale, 1.0));
+    float3 worldRayDir = normalize(mul((float3x3)localToWorldMatrix, localRayDir));
+
+    float2 jitter = RandomPointInCircle(rngState) * (divergeStrength / width);
+    float3 camRight = localToWorldMatrix[0].xyz;
+    float3 camUp    = localToWorldMatrix[1].xyz;
+
+    float3 jittered = worldRayDir + camRight * jitter.x + camUp * jitter.y;
+    return normalize(jittered);
+}
+
+float RayBoundingBoxDst(Ray ray, float3 boundsMin, float3 boundsMax)
+{
+    float3 tMin = (boundsMin - ray.origin) / ray.dir;
+    float3 tMax = (boundsMax - ray.origin) / ray.dir;
+
+    float3 t1 = min(tMin, tMax); // Entry
+    float3 t2 = max(tMin, tMax); // Exit
+
+    float dstNear = max(max(t1.x, t1.y), t1.z);
+    float dstFar  = min(min(t2.x, t2.y), t2.z);
+
+    bool didHit = dstFar >= dstNear && dstFar > 0;
+    return didHit ? dstNear : 1.#INF;
+}
+
+HitInfo RaySphere(Ray ray, float3 sphereCenter, float sphereRadius)
+{
+    HitInfo hitInfo = (HitInfo)0;
+    float3 oc = ray.origin - sphereCenter;
+
+    float a = dot(ray.dir, ray.dir);
+    float b = 2.0 * dot(oc, ray.dir);
+    float c = dot(oc, oc) - sphereRadius * sphereRadius;
+    float discriminant = b * b - 4.0 * a * c;
+
+    if (discriminant >= 0)
+    {
+        float dst = (-b - sqrt(discriminant)) / (2.0 * a);
+        if (dst >= 0)
+        {
+            hitInfo.didHit = true;
+            hitInfo.dst = dst;
+            hitInfo.hitPoint = ray.origin + ray.dir * dst;
+            hitInfo.normal = normalize(hitInfo.hitPoint - sphereCenter);
+        }
+    }
+    return hitInfo;
+}
+
+HitInfo RayTriangle_v1(Ray ray, Triangle tri, bool detectBackFace)
+{
+    float3 edgeAB = tri.posB - tri.posA;
+    float3 edgeAC = tri.posC - tri.posA;
+    float3 triFaceVector = cross(edgeAB, edgeAC);
+    float3 vertRayOffset = ray.origin - tri.posA;
+    float3 rayOffsetPerp = cross(vertRayOffset, ray.dir);
+
+    float determinant = dot(ray.dir, triFaceVector);
+    float invDet = 1 / determinant;
+
+    float dst = -dot(vertRayOffset, triFaceVector) * invDet;
+    float u = -dot(edgeAC, rayOffsetPerp) * invDet;
+    float v = dot(edgeAB, rayOffsetPerp) * invDet;
+    float w = 1 - v - u;
+
+    HitInfo hitInfo;
+    bool isValid = detectBackFace ? abs(determinant) >= 1E-6 : determinant <= 1E-6;
+    hitInfo.didHit = isValid && dst >= 0 && u >= 0 && v >= 0 && w >= 0;
+    hitInfo.hitPoint = ray.origin + ray.dir * dst;
+    hitInfo.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v) * -sign(determinant);
+    hitInfo.dst = dst;
+    hitInfo.materialIndex = tri.materialIndex;
+    hitInfo.isBackFace = determinant > 0;
+    return hitInfo;
+}
+
+HitInfo RayTriangle(Ray ray, Triangle tri, bool cullBackface)
+{
+    float3 edgeAB = tri.posB - tri.posA;
+    float3 edgeAC = tri.posC - tri.posA;
+    float3 triFaceVector = cross(edgeAB, edgeAC);
+    float3 vertRayOffset = ray.origin - tri.posA;
+    float3 rayOffsetPerp = cross(vertRayOffset, ray.dir);
+    float determinant = -dot(ray.dir, triFaceVector);
+    float invDet = 1 / determinant;
+
+    // Calculate hit-dst and barycentric coordinates
+    float dst = dot(vertRayOffset, triFaceVector) * invDet;
+    float u = dot(edgeAC, rayOffsetPerp) * invDet;
+    float v = -dot(edgeAB, rayOffsetPerp) * invDet;
+    float w = 1 - u - v;
+
+    // Initialize hit info
+    HitInfo hitInfo;
+    bool keep = cullBackface ? determinant >= 1E-8 : abs(determinant) >= 1E-8;
+    hitInfo.didHit = keep && dst > 0 && u >= 0 && v >= 0 && w >= 0;
+    float3 smoothNormal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+    hitInfo.normal = smoothNormal * sign(determinant);
+    //hitInfo.normal = normalize(triFaceVector);
+    hitInfo.isBackFace = determinant < 0;
+    hitInfo.hitPoint = ray.origin + ray.dir * dst;
+    hitInfo.dst = dst;
+    hitInfo.materialIndex = tri.materialIndex;
+    return hitInfo;
+}
+
+float3 GetEnvironmentLight(Ray ray)
+{
+    float skyGradientT = pow(smoothstep(0, 0.4, ray.dir.y), 0.35);
+	float groundToSkyT = smoothstep(-0.01, 0, ray.dir.y);
+	float3 skyGradient = lerp(SkyColorHorizon, SkyColorZenith, skyGradientT);
+	float sun = pow(max(0, dot(ray.dir, SunPos)), SunFocus) * SunIntensity;
+	float3 composite = lerp(GroundColor, skyGradient, groundToSkyT) + sun * (groundToSkyT>=1);
+	return composite;
+}
+
+HitInfo RayTriangleBVH(Ray ray, int nodeOffset, int triOffset, bool detectBackFaces)
+{
+    int nodeStack[32];
+    int stackIndex = 0;
+    nodeStack[stackIndex++] = 0;
+
+    HitInfo result;
+    result.dst = 1e20;
+    result.didHit = false;
+
+    while (stackIndex > 0)
+    {
+        int nodeIndex = nodeStack[--stackIndex];
+        Node node = nodes[nodeIndex + nodeOffset];
+
+        if (node.triangleCount > 0)
+        {
+            for (int i = node.index; i < node.index + node.triangleCount; i++)
+            {
+                HitInfo triHitInfo = RayTriangle(ray, triangles[i + triOffset], detectBackFaces);
+                if (triHitInfo.didHit && triHitInfo.dst < result.dst)
+                {
+                    result = triHitInfo;
+                }
+            }
+        }
+        else
+        {
+            int childIndexA = node.index + 0;
+            int childIndexB = node.index + 1;
+            Node childA = nodes[childIndexA + nodeOffset];
+            Node childB = nodes[childIndexB + nodeOffset];
+
+            float dstA = RayBoundingBoxDst(ray, childA.boundsMin, childA.boundsMax);
+            float dstB = RayBoundingBoxDst(ray, childB.boundsMin, childB.boundsMax);
+
+            bool isNearestA = dstA < dstB;
+            float dstNear = isNearestA ? dstA : dstB;
+            float dstFar = isNearestA ? dstB : dstA;
+            int childIndexNear = isNearestA ? childIndexA : childIndexB;
+            int childIndexFar = isNearestA ? childIndexB : childIndexA;
+
+            if (dstFar < result.dst) nodeStack[stackIndex++] = childIndexFar;
+            if (dstNear < result.dst) nodeStack[stackIndex++] = childIndexNear;
+        }
+    }
+    return result;
+}
+
+HitInfo CalculateRayCollision(Ray ray)
+{
+    HitInfo result;
+    result.dst = 1e20;
+    Ray localRay;
+
+    for (int i = 0; i < numMeshes; i++)
+    {
+        MeshInfo meshInfo = meshes[i];
+        localRay.origin = mul(meshInfo.worldToLocalMatrix, float4(ray.origin, 1));
+        localRay.dir = mul(meshInfo.worldToLocalMatrix, float4(ray.dir, 0));
+
+        bool detectBackFaces = materials[meshInfo.materialIndex].flag == 1;
+        HitInfo hitInfo = RayTriangleBVH(localRay, meshInfo.nodeOffset, meshInfo.triangleOffset, detectBackFaces);
+
+        if (hitInfo.dst < result.dst)
+        {
+            result.didHit = true;
+            result.dst = hitInfo.dst;
+            result.normal = normalize(mul((float3x3)transpose(meshInfo.worldToLocalMatrix), hitInfo.normal));
+            float3 localHitPoint = localRay.origin + localRay.dir * hitInfo.dst;
+            result.hitPoint = mul(meshInfo.localToWorldMatrix, float4(localHitPoint, 1)).xyz;
+            result.materialIndex = meshInfo.materialIndex;
+            result.isBackFace = hitInfo.isBackFace;
+        }
+    }
+
+    return result;
+}
+
+float3 Refract(float3 inDir, float3 normal, float iorA, float iorB)
+{
+    float refractRatio = iorA / iorB;
+    float cosAngleIn = -dot(inDir, normal);
+    float sinSqrAngleOfRefraction = refractRatio * refractRatio * (1 - cosAngleIn * cosAngleIn);
+    if (sinSqrAngleOfRefraction > 1) return 0; // Ray is fully reflected, no refraction occurs
+
+    float3 refractDir = refractRatio * inDir + (refractRatio * cosAngleIn - sqrt(1 - sinSqrAngleOfRefraction)) * normal;
+    return refractDir;
+}
+
+float3 Reflect(float3 inDir, float3 normal)
+{
+    return inDir - 2 * dot(inDir, normal) * normal;
+}
+
+float CalculateReflectance(float3 inDir, float3 normal, float iorA, float iorB)
+{
+    float refractRatio = iorA / iorB;
+    float cosAngleIn = saturate(-dot(inDir, normal)); // clamp for numeric safety
+    float sinSqrAngleOfRefraction = refractRatio * refractRatio * (1 - cosAngleIn * cosAngleIn);
+
+    // total internal reflection
+    if (sinSqrAngleOfRefraction >= 1.0) return 1.0;
+
+    float cosAngleOfRefraction = sqrt(max(0.0, 1 - sinSqrAngleOfRefraction));
+
+    // Perpendicular polarization (r⊥)
+    float denomPerp = iorA * cosAngleIn + iorB * cosAngleOfRefraction;
+    if (abs(denomPerp) < 1e-8) return 1.0;
+    float rPerp = (iorA * cosAngleIn - iorB * cosAngleOfRefraction) / denomPerp;
+    rPerp = rPerp * rPerp;
+
+    // Parallel polarization (r∥)
+    float denomPar = iorB * cosAngleIn + iorA * cosAngleOfRefraction; // <--- FIXED
+    if (abs(denomPar) < 1e-8) return 1.0;
+    float rPar = (iorB * cosAngleIn - iorA * cosAngleOfRefraction) / denomPar;
+    rPar = rPar * rPar;
+
+    return 0.5 * (rPerp + rPar);
+}
+
+LightResponse CalculateReflectionAndRefraction(float3 inDir, float3 normal, float iorA, float iorB)
+{
+    LightResponse result;
+
+    // Calculate the two directions that light can take
+    result.reflectDir = Reflect(inDir, normal);
+    result.refractDir = Refract(inDir, normal, iorA, iorB);
+
+    // Calculate the proportion of light [0, 1] that takes each path
+    result.reflectWeight = CalculateReflectance(inDir, normal, iorA, iorB);
+    result.refractWeight = 1 - result.reflectWeight;
+
+    return result;
+}
+
+float3 GetMaterialColour(RayTracingMaterial mat, float3 pos, float3 normal, bool isSpecularBounce)
+{
+    float3 col = mat.color;
+    return lerp(col, mat.specularColor, isSpecularBounce);
+}
+
+float3 Trace_Stoch(Ray ray, inout uint rngState)
+{
+    float3 totalLight = 0;
+
+    for (int i = 0; i <= maxBounceCount; i++)
+    {
+        HitInfo hit = CalculateRayCollision(ray);
+        if (!hit.didHit)
+        {
+            totalLight += GetEnvironmentLight(ray);
+            break;
+        }
+
+        RayTracingMaterial material = materials[hit.materialIndex];
+        bool isSpecularBounce = material.specularProbability >= RandomValue(rngState);
+
+        if (material.flag == 1)
+        {
+            // Absorb some amount of light as it travels through the object
+            //if (hit.isBackface) ray.transmittance *= exp(-hit.dst * material.absorption.rgb * material.absorptionStrength);
+
+            float iorCurrent = hit.isBackFace ? material.ior : 1;
+            float iorNext = hit.isBackFace ? 1 : material.ior;
+            LightResponse lr = CalculateReflectionAndRefraction(ray.dir, hit.normal, iorCurrent, iorNext);
+
+            // Calculate random direction in hemisphere around surface normal (cosine-weighted)
+            //float3 diffuseDir = normalize(hit.normal + RandomDirection(rngState));
+            // Randomize the reflect/refract directions based on smoothness for a frosted effect
+            //lr.reflectDir = normalize(lerp(diffuseDir, lr.reflectDir, material.specularProbability));
+            //lr.refractDir = normalize(lerp(-diffuseDir, lr.refractDir, material.smoothness));
+
+            // Choose between reflection and refraction probabilistically based on proportion of light going each way
+            bool followReflection = RandomValue(rngState) <= lr.reflectWeight;
+            ray.dir = followReflection ? lr.reflectDir : lr.refractDir;
+            ray.origin = hit.hitPoint + 0.0001 * hit.normal * sign(dot(hit.normal, ray.dir));
+        }
+        else
+        {
+
+            // Redirect ray based on collision info
+            ray.origin = hit.hitPoint + (hit.normal * 0.0001);
+            float3 diffuseDir = normalize(hit.normal + RandomDirection(rngState));
+            float3 specularDir = reflect(ray.dir, hit.normal);
+            ray.dir = normalize(lerp(diffuseDir, specularDir, material.smoothness * isSpecularBounce));
+
+            // Update light info
+            float3 emittedLight = material.emissionColor * material.emissionStrength;
+            totalLight += emittedLight * ray.transmittance;
+        }
+        ray.transmittance *= GetMaterialColour(material, hit.hitPoint, hit.normal, isSpecularBounce);
+    }
+
+    return totalLight;
+}
+
+[numthreads(32,32,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float4 oldRender = Result[id.xy];
+
+    if (id.x >= width || id.y >= height) return;
+
+    uint rngState = id.x * 1973 + id.y * 9277 + 891231 + numRenderedFrames * 756391 + totalFrames * 42894;
+
+    float3 totalIncomingLight = 0;
+
+    for (int rayIndex = 0; rayIndex < numRaysPerPixel; rayIndex++)
+    {
+        Ray ray = CreateNewRay(GetTransformedRay(id, rngState), cameraPosition, 1, 0);
+        totalIncomingLight += Trace_Stoch(ray, rngState);
+    }
+
+    float3 pixelCol = totalIncomingLight / numRaysPerPixel; 
+
+    float weight = 1.0 / (numRenderedFrames + 1);
+    float4 accumulatedAverage = oldRender * (1-weight) + float4(pixelCol, 1) * weight;
+    Result[id.xy] = accumulatedAverage;
+}
